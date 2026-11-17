@@ -1,0 +1,102 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Prokopiev; see LICENSE and NOTICE in the repository root.
+# Live server dashboard on the USB LCD panel — starts at boot, restarts on exit.
+#
+# Install (from the project directory):
+#
+#   sudo make install install-udev      # usblcd + non-root panel access
+#   sudo make service                   # /opt/usblcd + this unit, enabled
+#
+# Tune it without editing the unit: create /etc/usblcd/dashboard.conf with any
+# of the keys below (all optional), then `systemctl restart usblcd-dashboard`.
+#
+#   TITLE=myhost           header title (empty = the machine hostname)
+#   PAGES=CPU,GPU,PROC     pages to rotate; a single page pins the panel
+#   PAGE_SECONDS=12        seconds per page (0 = never rotate)
+#   INTERVAL=1             seconds between frames
+#   WEIGHT=500             Inter variable weight
+#   CPUS=16-23             pin to specific CPUs, e.g. the efficient cores of a
+#                          hybrid CPU (see the note under CPUAffinity below)
+#   NICE=10                scheduling priority
+#
+# dash.py draws a frame per interval and pipes raw RGBA into `usblcd feed`.
+# The panel reverts to its boot logo the moment the service stops, which is the
+# behaviour you want from `systemctl stop`.
+
+[Unit]
+Description=usblcd live dashboard on the USB LCD panel
+Documentation=file:///opt/usblcd/README.md
+After=local-fs.target network-online.target
+# a crashing loop should not stay recoverable forever, but a panel unplugged
+# for an hour must not put the unit in a failed state either
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/usblcd
+Environment=TITLE=
+Environment=PAGES=CPU,GPU,PROC
+Environment=PAGE_SECONDS=12
+Environment=INTERVAL=1
+Environment=WEIGHT=500
+Environment=CPUS=all
+Environment=NICE=10
+# a unit running as nobody has no HOME, so the measured panel calibration is
+# given explicitly; usblcd also falls back to /etc/usblcd/calibration
+Environment=USBLCD_CALIB=/etc/usblcd/calibration
+EnvironmentFile=-/etc/usblcd/dashboard.conf
+ExecStart=/usr/bin/python3 /opt/usblcd/dash/dash.py \
+    --exec /usr/local/bin/usblcd \
+    --title ${TITLE} \
+    --interval ${INTERVAL} \
+    --pages ${PAGES} \
+    --page-seconds ${PAGE_SECONDS} \
+    --weight ${WEIGHT} \
+    --cpus ${CPUS} \
+    --nice ${NICE}
+Restart=always
+RestartSec=5
+# A replug is covered by the Restart loop: `usblcd` re-opens the device on the
+# next attempt, so no device-unit dependency is needed here.
+#
+# Dedicated account, created by contrib/sysusers.d/usblcd.conf: the dashboard
+# needs no HOME, owns no files and writes nothing.  Panel access is the group
+# of that user — the udev rule puts the device node in group `usblcd` at 0660 —
+# so no supplementary groups are needed (systemd's Groups= only applies to
+# DynamicUser= units) and `nobody` is not shared with anything else:
+#   sudo systemd-sysusers /usr/lib/sysusers.d/usblcd.conf
+#   sudo usermod -aG usblcd you          # humans driving the panel by hand
+#
+# No Group= line on purpose: systemd uses the primary group of the user, which
+# sysusers.d already creates with the same name.
+User=usblcd
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# /dev/bus/usb is the whole point, so PrivateDevices= is deliberately NOT set
+# systemd expands ${VAR} in Exec* lines only, so the scheduler setting below is
+# a literal: change it with `systemctl edit`, matching --nice above.
+Nice=10
+# No CPUAffinity here on purpose: the default CPUS=all lets the scheduler place
+# the two processes anywhere.  On a hybrid-CPU box you probably want the slow
+# cores, so the dashboard gets the load and the fast cores stay free for real
+# work: find the group with `lscpu -e=CPU,CORE,MAXMHZ` (the low-MHz group) and
+# set CPUS in /etc/usblcd/dashboard.conf, plus a drop-in with the same list in
+# CPUAffinity= if you want it applied to the whole unit (systemd applies
+# CPUAffinity to every process in the unit, covering the `usblcd feed` child;
+# dash.py --cpus is the per-process equivalent).
+#   systemctl edit usblcd-dashboard.service   ->  [Service] CPUAffinity=4-11
+# one JPEG frame per second is the whole point; a full core of output logging
+# is not, and the journal is where the layout reports land
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=usblcd-dashboard
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Prokopiev; see LICENSE and NOTICE in the repository root.
+# Give non-root users (and the usblcd systemd service) access to the panel.
+#
+# The service runs as its own system user, created by contrib/sysusers.d:
+#
+#   sudo systemd-sysusers /usr/lib/sysusers.d/usblcd.conf
+#   sudo usermod -aG usblcd you         # anyone driving the panel by hand
+#
+# That user's primary group is `usblcd`, which is the group this rule puts the
+# device node in — so the service needs no supplementary groups, and only the
+# members of `usblcd` can drive the screen.  MODE=0666 is the looser "just make
+# it work on a headless box" form: anyone local can drive the panel.  TAG=
+# "uaccess" alone grants the logged-in local seat only, which is not enough for
+# a system service.
+
+SUBSYSTEM=="usb", ATTR{idVendor}=="87ad", ATTR{idProduct}=="70db", GROUP="usblcd", MODE="0660", TAG+="uaccess"
+
+# The SCSI-wired sibling (87cd:70db) is served by sg2/sg3 and the SCSI path in
+# trcc; it is listed here for completeness, commented out, because usblcd does
+# not speak that wire.
+# SUBSYSTEM=="usb", ATTR{idVendor}=="87cd", ATTR{idProduct}=="70db", GROUP="usblcd", MODE="0660", TAG+="uaccess"

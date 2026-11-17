@@ -1,0 +1,23 @@
+# build output
+/usblcd
+build/
+/build/*.o
+/build/*.d
+*.so
+
+# python
+__pycache__/
+*.pyc
+
+# rendered frames, captures and ad-hoc logs never belong in the repo
+frame.ppm
+/dash/frame.ppm
+/out/
+*.log
+*.raw
+
+# editors
+*.swp
+*~
+.idea/
+.vscode/
