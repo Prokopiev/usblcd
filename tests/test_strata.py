@@ -84,7 +84,7 @@ def fixture(state='idle', cards=2):
                      'gpu_mem_total': 27832352768, 'gpu_temp': 56,
                      'gpu_power': 348.572, 'gpu_power_limit': 680.0,
                      'gpu_pcie_gen': 3, 'gpu_pcie_gen_max': 3, 'gpu_pcie_width': 4,
-                     'gpu_pcie_rx_mb': 2777.19, 'cpu': 66.6,
+                     'gpu_pcie_rx_mb': 2777.19, 'gpu_pcie_tx_mb': 943.91, 'cpu': 66.6,
                      'ram_used': 60323405824, 'ram_total': 67168075776,
                      'disk_read_mb': 5.5, 'disk_write_mb': 0.007, 'tok_s': 162.09},
         'hardware_static': {'gpu_name': 'RTX 3080 + RTX 5080', 'gpu_count': 2,
@@ -215,6 +215,10 @@ def main():
                 os.environ['STRATA_URL'] = saved
         ok &= check('a box with no strata state finds nothing',
                     dash.strata_endpoints([os.path.join(tmp, 'nope')]) == [])
+        ok &= check('the mapping keeps no PCIe history (that tile has no curve)',
+                    'pcie_hist' not in dash.strata_view(fixture('idle')) and
+                    dash.strata_view(fixture('idle'))['pcie_tx'] == 943.91,
+                    str(dash.strata_view(fixture('idle')).get('pcie_tx')))
 
         # `sudo python3 tools/strata_conf.py` runs as root, and root has no strata
         # install: the state belongs to the login that typed sudo
@@ -345,6 +349,17 @@ def main():
                 # dropping columns is allowed (and reported); drawing past the
                 # panel edge is not
                 good = good and any('RECENT drops' in s for s in c.info)
+            if name == 'idle, two cards':
+                # the PCIe tile keeps its captions where the curve used to be, at
+                # a size that fits its panel, and nothing spills into the strip
+                # below it
+                pcie = [p for p in c.panels if p[4] == 'PCIE RX']
+                px, py, pw, ph, _pt = pcie[0]
+                inside = [b[4] for b in c.boxes
+                          if px <= b[0] < px + pw and py <= b[1] < py + ph]
+                good = good and any(s.startswith('TX ') for s in inside) and \
+                    not any('no history' in s for s in inside)
+                note = '%s  %s' % (inside, c.over[:1]) if not good else note
         except Exception as e:                                  # noqa: BLE001
             good, note = False, '%s: %s' % (e.__class__.__name__, e)
         ok &= check('render: %s' % name, good, note or '(%d panels)' % len(c.panels))

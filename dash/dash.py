@@ -991,7 +991,7 @@ def strata_view(d):
         'pcie': (snum(hw.get('gpu_pcie_rx_mb')),
                  snum(hw.get('gpu_pcie_gen')) or snum(hw.get('gpu_pcie_gen_max')),
                  snum(hw.get('gpu_pcie_width'))),
-        'pcie_hist': sseries(hist, 'gpu_pcie_rx_mb'),
+        'pcie_tx': snum(hw.get('gpu_pcie_tx_mb')),
         'cpu': snum(hw.get('cpu_pct')) if hw.get('cpu_pct') is not None else snum(hw.get('cpu')),
         'cpu_hist': sseries(hist, 'cpu'),
         'cores': int(snum(stat.get('cores')) or 0),
@@ -2017,18 +2017,39 @@ def ai_hi(series, floor):
     return max(floor, (max(vals) if vals else 0.0) * 1.1)
 
 
-def ai_tile(c, x, y, w, h, title, foot, big, unit, series, lo, hi, color):
+def ai_tile(c, x, y, w, h, title, foot, big, unit, series, lo, hi, color,
+            spark=True, extra=None):
     """One Overview tile: a big number, a caption, and the server's own history.
 
     The histories come in the /metrics reply (a minute per series), so the AI
     page draws the same curve `strata monitor` draws instead of building its own
-    ring buffer out of a 1 fps poll."""
+    ring buffer out of a 1 fps poll.
+
+    `spark=False` keeps the curve out of the tile: the PCIe counter is what the
+    engine's own PCIe share is computed from, and its curve is a step function of
+    when a request started, not a signal to read off a panel.  The freed space
+    goes to a second caption (`extra`) at the caption size, so the tile reads as
+    a tile with one line more, not as a tile with a hole in it.
+    """
     ix, iy = panel(c, x, y, w, h, title, None)
     sc = pick_scale(c, big, (5, 4, 3), max(20, w - 16 - c.text_w(unit, 3) - 10))
     c.text(ix, iy, big, sc, color)
     c.text(ix + c.text_w(big, sc) + 8,
            iy + (c.text_h(sc) - c.text_h(3)) // 2, unit, 3, DIM)
     row = iy + max(c.text_h(sc), c.text_h(3)) + 5
+    if not spark:
+        # the two captions take the space the curve would have taken, at the
+        # biggest size both of them fit in: a tile with a hole in it is worse
+        # than a tile with small captions, and text past the panel edge is worse
+        # than both
+        room = (y + h - 8) - row
+        fs = 2 if c.text_h(2) * (2 if extra else 1) + (5 if extra else 0) <= room else 1
+        c.text(ix, row, ellipsize(c, foot, fs, w - 16), fs, DIM)
+        if extra:
+            row2 = row + c.text_h(fs) + 5
+            if row2 + c.text_h(fs) <= y + h - 8:
+                c.text(ix, row2, ellipsize(c, extra, fs, w - 16), fs, DIM)
+        return
     c.text(ix, row, ellipsize(c, foot, 1, w - 16), 1, DIM)
     top = row + c.text_h(1) + 6
     gw = w - 16
@@ -2135,31 +2156,42 @@ def body_ai(c, m, args, y0, h):
     cards_note = ('BUSIEST OF %d CARDS' % v['gpus']) if v['gpus'] > 1 else 'THE ONLY CARD'
     hot_note = ('HOTTEST OF %d CARDS' % v['gpus']) if v['gpus'] > 1 else 'THE ONLY CARD'
     tiles = [
-        ('SPEED', sfmt(speed, 0), 'T/S', note, v['speed_hist'],
-         0, ai_hi(v['speed_hist'], 50), ACCENT),
-        ('GPU LOAD', sfmt(v['util']), '%', cards_note,
-         v['util_hist'], 0, 100, ACCENT),
-        ('VRAM', sfmt(vu, 1), 'GB',
-         '%.0f%% OF %.1f GB' % (100.0 * vu / vt, vt) if vu is not None and vt else '-- OF -- GB',
-         v['vram_hist'], 0, max(vt or 0.0, vu or 0.0) * 1.05, WARN),
-        ('GPU TEMP', sfmt(v['temp']), 'C', hot_note, v['temp_hist'],
-         0, ai_hi(v['temp_hist'], 95), temp_color(v['temp'])),
-        ('POWER', sfmt(pw), 'W',
-         '%.0f%% OF %.0f W' % (100.0 * pw / pl, pl) if pw is not None and pl else 'OF -- W',
-         v['power_hist'], 0, max(pl or 0.0, ai_hi(v['power_hist'], 100)), OK),
-        ('PCIE RX', sfmt(rx), 'MB/S',
-         'GEN %s x%s' % (sfmt(pgen), sfmt(pwidth)), v['pcie_hist'],
-         0, ai_hi(v['pcie_hist'], 100), OK),
-        ('CPU', sfmt(v['cpu']), '%', 'HOST CPU, %d CORES' % max(0, v['cores']),
-         v['cpu_hist'], 0, 100, OK),
-        ('DISK READ', sfmt(v['disk'][0], 1), 'MB/S',
-         'WRITE %s MB/S' % sfmt(v['disk'][1], 1), v['disk_hist'],
-         0, ai_hi(v['disk_hist'], 10), TEXT),
+        dict(title='SPEED', big=sfmt(speed, 0), unit='T/S', foot=note,
+             series=v['speed_hist'], lo=0, hi=ai_hi(v['speed_hist'], 50), color=ACCENT),
+        dict(title='GPU LOAD', big=sfmt(v['util']), unit='%', foot=cards_note,
+             series=v['util_hist'], lo=0, hi=100, color=ACCENT),
+        dict(title='VRAM', big=sfmt(vu, 1), unit='GB',
+             foot='%.0f%% OF %.1f GB' % (100.0 * vu / vt, vt) if vu is not None and vt
+                  else '-- OF -- GB',
+             series=v['vram_hist'], lo=0, hi=max(vt or 0.0, vu or 0.0) * 1.05, color=WARN),
+        dict(title='GPU TEMP', big=sfmt(v['temp']), unit='C', foot=hot_note,
+             series=v['temp_hist'], lo=0, hi=ai_hi(v['temp_hist'], 95),
+             color=temp_color(v['temp'])),
+        dict(title='POWER', big=sfmt(pw), unit='W',
+             foot='%.0f%% OF %.0f W' % (100.0 * pw / pl, pl) if pw is not None and pl
+                  else 'OF -- W',
+             series=v['power_hist'], lo=0, hi=max(pl or 0.0, ai_hi(v['power_hist'], 100)),
+             color=OK),
+        # no history here on purpose: the PCIe counter jumps with the start of
+        # each request, so its curve is a staircase of request boundaries, not a
+        # signal — the number, the link it is moving over and the other
+        # direction of the link are what say anything on a panel
+        dict(title='PCIE RX', big=sfmt(rx), unit='MB/S',
+             foot='GEN %s x%s LINK' % (sfmt(pgen), sfmt(pwidth)),
+             series=None, lo=0, hi=1, color=OK, spark=False,
+             extra='TX %s MB/S' % sfmt(v['pcie_tx'])),
+        dict(title='CPU', big=sfmt(v['cpu']), unit='%',
+             foot='HOST CPU, %d CORES' % max(0, v['cores']),
+             series=v['cpu_hist'], lo=0, hi=100, color=OK),
+        dict(title='DISK READ', big=sfmt(v['disk'][0], 1), unit='MB/S',
+             foot='WRITE %s MB/S' % sfmt(v['disk'][1], 1),
+             series=v['disk_hist'], lo=0, hi=ai_hi(v['disk_hist'], 10), color=TEXT),
     ]
-    for i, (title, big, unit, foot, series, lo, hi, col_c) in enumerate(tiles):
+    for i, t in enumerate(tiles):
         r, k = divmod(i, cols)
         ai_tile(c, 8 + k * (col + 8), ty + r * (tile_h + 8), col, tile_h,
-                title, foot, big, unit, series, lo, hi, col_c)
+                t['title'], t['foot'], t['big'], t['unit'], t['series'],
+                t['lo'], t['hi'], t['color'], t.get('spark', True), t.get('extra'))
 
     # ── the Overview's three bars (context, experts, RAM) + recent requests
     by = ty + 2 * (tile_h + 8)
