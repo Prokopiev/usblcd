@@ -43,6 +43,7 @@ done
 ./build/ppm2png build/tests/dash.ppm build/tests/dash.png >/dev/null && echo "ppm2png OK"
 python3 dash/dash.py --font-sample --out build/tests/font.ppm >/dev/null && echo "font sheet OK"
 python3 tests/test_font.py
+python3 tests/test_gpu.py
 
 echo
 echo "== calibration store (measured-on-glass offsets)"

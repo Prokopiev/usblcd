@@ -27,6 +27,10 @@
 Description=usblcd live dashboard on the USB LCD panel
 Documentation=file:///opt/usblcd/README.md
 After=local-fs.target network-online.target
+# deliberately no NVIDIA dependency: on a box where the dashboard starts at
+# boot, nvidia-smi answers a few seconds after this unit does, and dash.py
+# keeps polling, so the GPU page fills itself in (see the GPU page note in the
+# README).  A `Wants=` on the driver would only move the race, not fix it.
 # a crashing loop should not stay recoverable forever, but a panel unplugged
 # for an hour must not put the unit in a failed state either
 StartLimitIntervalSec=0

@@ -242,6 +242,19 @@ rolling history; NVMe/chassis temps; fan RPM; top processes by CPU and by RSS.
 Every section is guarded on its own — a missing sensor drops its panel, it
 never stops the frame.
 
+The GPU page is the one fed by a program rather than a sysfs file, so it has
+its own rules: `nvidia-smi` runs in a background thread (a slow query can never
+stall a frame) and a failed query is retried for as long as the dashboard runs,
+with the poll slowing down while it fails. A service that starts at boot is at
+the panel before the NVIDIA driver answers `nvidia-smi`, so an empty GPU page
+right after boot is the normal case — it fills itself in, no restart. The page
+says which of the three cases it is in: `GPU PAGE DISABLED` (`--no-gpu`),
+`NO NVIDIA-SMI` (this box has no NVIDIA, the only permanent stop), and
+`PROBING nvidia-smi` / `QUERY FAILED` (driver not answering: nvidia-smi's own
+reason, the attempt count, and how long ago the last good reply was). Numbers
+kept on screen from an older reply are marked `STALE Ns` — an unlabelled stale
+number on a dashboard is worse than no number.
+
 Layout (960×540 default; `--width/--height` for other panels). The header
 (host, title, kernel, uptime, clock) stays on **every** page, with tabs showing
 which page is up and a countdown to the next; the body rotates through three
@@ -330,6 +343,10 @@ user it has no HOME, so the unit sets
 `systemctl stop` releases the panel and the firmware returns to its boot logo.
 It needs FreeType for TTF text; without `build/ttfplan` it falls back to the
 bitmap font.
+
+The unit deliberately depends on nothing NVIDIA: it starts seconds before the
+driver answers `nvidia-smi`, and the dashboard's GPU poller retries, so the GPU
+page fills in by itself a few seconds after boot.
 
 ## Capture pipelines (`feed`)
 

@@ -15,9 +15,11 @@ libusb.
     dash.py --font-sample --out s.ppm   # draw the whole font sheet
 
 Sensors come from hwmon, /proc, statvfs and nvidia-smi.  nvidia-smi runs in a
-background thread so a slow query can never stall a frame, and every section is
-guarded on its own: a missing sensor drops its panel, it does not stop the
-frame.
+background thread so a slow query can never stall a frame, and it is retried
+with a backoff for as long as the dashboard runs: a driver that boots after
+this service, a GPU mid-reset and a driver mid-upgrade all heal on their own,
+so the GPU page fills itself in.  Every section is guarded on its own: a
+missing sensor drops its panel, it does not stop the frame.
 """
 from __future__ import annotations
 
@@ -496,16 +498,43 @@ GPU_QUERY = ('utilization.gpu', 'memory.used', 'memory.total', 'temperature.gpu'
              'fan.speed', 'power.draw', 'utilization.memory', 'name')
 
 
+def smi_reason(raw, limit=120):
+    """nvidia-smi's first real stderr line, for the panel's status line.
+
+    'NVIDIA-SMI has failed because it couldn't communicate with the NVIDIA
+    driver' and 'No devices were found' are the two messages that matter on a
+    dashboard: they say the driver is not answering yet, which heals, as
+    opposed to this box having no NVIDIA at all, which does not.
+    """
+    for line in (raw or b'').decode(errors='replace').splitlines():
+        line = ' '.join(line.split())
+        if line and not line.startswith('['):
+            return line[:limit]
+    return ''
+
+
 def query_gpus(timeout=5.0):
+    """(gpus, why): a list of GPU dicts, or (None, one-line reason).
+
+    `why` is what the GPU page shows when it has nothing to draw, so a
+    boot-time race, a dead driver and a box with no NVIDIA look different.
+    The reason 'not installed' is the only one the poller treats as final.
+    """
+    cmd = ['nvidia-smi', '--query-gpu=' + ','.join(GPU_QUERY),
+           '--format=csv,noheader,nounits']
     try:
-        r = subprocess.run(['nvidia-smi', '--query-gpu=' + ','.join(GPU_QUERY),
-                            '--format=csv,noheader,nounits'],
-                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                            timeout=timeout)
-        if r.returncode != 0:
-            return None
-    except (OSError, subprocess.SubprocessError):
-        return None
+    except FileNotFoundError:
+        return None, 'not installed'
+    except OSError as e:
+        return None, 'spawn failed: %s' % (e.strerror or e.__class__.__name__)
+    except subprocess.TimeoutExpired:
+        return None, 'query timed out after %gs' % timeout
+    except subprocess.SubprocessError as e:
+        return None, e.__class__.__name__
+    if r.returncode != 0:
+        return None, ('rc=%d %s' % (r.returncode, smi_reason(r.stderr))).strip()
     gpus = []
     for line in r.stdout.decode(errors='replace').strip().splitlines():
         f = [x.strip() for x in line.split(',')]
@@ -520,29 +549,63 @@ def query_gpus(timeout=5.0):
         gpus.append({'name': f[7] if len(f) > 7 else 'GPU', 'util': num(0),
                      'mem_used': num(1), 'mem_total': num(2), 'temp': num(3),
                      'fan': num(4), 'power': num(5), 'mem_util': num(6)})
-    return gpus or None
+    return (gpus or None), ('' if gpus else 'no devices answered')
 
 
 class GPUThread(threading.Thread):
+    """nvidia-smi in the background, polled for as long as we are running.
+
+    A failed query is never fatal, and it is never the end of polling: this
+    dashboard starts at boot, seconds before the driver answers nvidia-smi,
+    and queries fail for other reasons that all heal (the module reloading,
+    persistenced restarting, a GPU mid-reset, a driver mid-upgrade).  The old
+    'give up after 5 failures' turned that race into a GPU page that stayed
+    empty until the service was restarted.  So the poller backs off instead
+    (3, 6, 12, 24, 30s, then 2min once it is clearly not a transient) and the
+    first success lights the page back up by itself.  The one permanent stop
+    is a missing nvidia-smi binary: there is nothing there to poll.
+
+    `stale()` is seconds since the last good reply: the panel keeps painting
+    the last numbers it had and marks them stale, which is far more useful
+    than a page of zeros.
+    """
+
+    MAX_PERIOD = 30.0     # top of the normal backoff ladder
+    SLOW_AFTER = 24       # consecutive failures (~10 min) before a 2-minute poll
+    SLOW_PERIOD = 120.0
+
     def __init__(self, period=3.0):
         super().__init__(daemon=True)
-        self.period = period
+        self.base = self.period = period
         self.stop = threading.Event()
         self.gpus = None
         self.fail = 0
         self.disabled = False
+        self.why = 'probing'
+        self.good_at = 0.0
+
+    def stale(self):
+        """Seconds since the last good query, or None if there never was one."""
+        return (time.monotonic() - self.good_at) if self.good_at else None
 
     def run(self):
         while not self.stop.is_set():
-            g = query_gpus()
+            g, why = query_gpus()
             if g:
-                self.gpus, self.fail = g, 0
+                self.gpus, self.fail, self.why = g, 0, ''
+                self.good_at = time.monotonic()
+                self.period = self.base
             else:
                 self.fail += 1
-                if self.fail >= 5:
-                    self.disabled = True
+                self.why = why
+                if self.fail >= self.SLOW_AFTER:
+                    self.period = self.SLOW_PERIOD
+                else:
+                    self.period = min(self.MAX_PERIOD, self.base * 2 ** min(self.fail - 1, 4))
+                if why == 'not installed':
+                    self.disabled = True      # nothing to poll, ever
                     return
-            time.sleep(self.period)
+            self.stop.wait(self.period)       # also the fastest way out
 
 
 # ── metrics ────────────────────────────────────────────────────────────
@@ -1287,13 +1350,42 @@ def gpu_title(name):
 
 def body_gpu(c, m, args, y0, h, only=None):
     W = c.w
+    th = m.gpu_thread
+    stale = th.stale() if th is not None else None
     gpus = m.gpu or []
     if only is not None:
         gpus = gpus[only:only + 1]
     if not gpus:
-        panel(c, 8, y0, W - 16, h, 'GPU', 'no nvidia-smi result')
-        c.text(16, y0 + 40, 'QUERY FAILED OR NO GPU', 3, CRIT)
-        c.text(16, y0 + 74, 'nvidia-smi -L   /   dash.py --sensors', 2, DIM)
+        # an empty GPU page has three causes and they need three messages:
+        # --no-gpu (asked for), no nvidia-smi at all (this box has no NVIDIA),
+        # and a query failing right now (at boot that is the driver racing us,
+        # and it heals on its own -- the poller never gives up on that)
+        sub, head, col = 'no nvidia-smi result', 'QUERY FAILED OR NO GPU', CRIT
+        rows = []
+        if th is None:
+            sub, head, col = 'queries disabled', 'GPU PAGE DISABLED', DIM
+            rows = ['this run has --no-gpu']
+        elif th.disabled:
+            sub, head = 'nvidia-smi not installed', 'NO NVIDIA-SMI'
+            rows = ['install the NVIDIA driver, then: nvidia-smi -L']
+        elif stale is None:
+            head, col = 'PROBING nvidia-smi', (WARN if th.fail < 20 else CRIT)
+            rows = ['attempt %d, next in %.0fs -- a driver that boots after us'
+                    % (th.fail, th.period), th.why]
+        else:
+            head = 'QUERY FAILED'
+            col = CRIT if stale > 120 else WARN
+            rows = ['last good reply %.0fs ago, next try in %.0fs' % (stale, th.period),
+                    th.why]
+        rows.append('nvidia-smi -L   /   dash.py --sensors')
+        panel(c, 8, y0, W - 16, h, 'GPU', sub)
+        c.text(16, y0 + 40, ellipsize(c, head, 3, W - 32), 3, col)
+        y = y0 + 40 + c.text_h(3) + 12
+        for s in rows:
+            if y + c.text_h(2) > y0 + h - 8:
+                break
+            c.text(16, y, ellipsize(c, s, 2, W - 32), 2, DIM)
+            y += c.text_h(2) + 8
         return
     n = min(len(gpus), 2)
     col = (W - 16 - 8 * (n - 1)) // n
@@ -1302,7 +1394,12 @@ def body_gpu(c, m, args, y0, h, only=None):
     h1 = h - 144
     for i, g in enumerate(gpus[:n]):
         x = 8 + i * (col + 8)
-        ix, iy = panel(c, x, y0, col, h1, 'GPU %d' % i, gpu_title(g['name']))
+        # a query that failed while the page kept its last numbers says so: on
+        # a dashboard an unlabelled stale number is worse than no number
+        sub = gpu_title(g['name'])
+        if stale is not None and stale > 8.0:
+            sub = '%s STALE %.0fs' % (sub, stale)
+        ix, iy = panel(c, x, y0, col, h1, 'GPU %d' % i, sub)
         t = g.get('temp')
         u = g.get('util') or 0
         big_number(c, ix, iy, '%d' % u, '%', ACCENT, 8)
@@ -1534,6 +1631,12 @@ def print_sensors(m):
                                             % (g['name'], g['util'], g['mem_used'],
                                                g['mem_total'], g['temp'], g['fan'])
                                             for g in (m.gpu or [])) or 'NONE'))
+    th = m.gpu_thread
+    if th is not None and not (m.gpu or []):
+        # why a GPU page is empty lives in the poller, not in the sensors
+        print('gpu poll      : %s  (%d failures, next in %.0fs%s)'
+              % (th.why, th.fail, th.period,
+                 ', poller stopped' if th.disabled else ''))
     print('interfaces    : %s' % (', '.join(sorted(m.net) or ['NONE'])))
     print('freqs         : %s' % ('%d' % len(m.freqs)))
     print('disks         : %s' % (', '.join('%s %.0f%%' % (d[0], d[1] * 100)
@@ -1803,6 +1906,13 @@ def main():
         time.sleep(0.25)
 
     if args.sensors:
+        # nvidia-smi answers in a background thread: wait for it a little, so a
+        # driver that is still loading shows up as a poll reason on this report
+        # instead of a bare NONE
+        for _ in range(40):
+            if m.gpu_thread is None or m.gpu_thread.gpus:
+                break
+            time.sleep(0.25)
         m.sample()
         m.gpu = m.gpu_thread.gpus if m.gpu_thread else None
         print_sensors(m)
