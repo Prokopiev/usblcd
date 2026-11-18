@@ -72,16 +72,24 @@ install-udev:
 PREFIX ?= /opt/usblcd
 install-service: $(BIN) $(TOOLS)
 	install -d $(DESTDIR)$(PREFIX)/dash $(DESTDIR)$(PREFIX)/vendor \
-		$(DESTDIR)$(PREFIX)/build $(DESTDIR)$(PREFIX)/fonts
+		$(DESTDIR)$(PREFIX)/build $(DESTDIR)$(PREFIX)/fonts \
+		$(DESTDIR)$(PREFIX)/tools
 	install -m644 dash/dash.py dash/font57.py $(DESTDIR)$(PREFIX)/dash/
 	install -m644 vendor/stb_image.h vendor/stb_image_write.h $(DESTDIR)$(PREFIX)/vendor/
 	install -m755 $(TOOLS) $(DESTDIR)$(PREFIX)/build/
 	install -m644 fonts/Inter-var.ttf fonts/OFL.txt $(DESTDIR)$(PREFIX)/fonts/
+	install -m755 tools/strata_conf.py $(DESTDIR)$(PREFIX)/tools/
 	install -m644 README.md $(DESTDIR)$(PREFIX)/
 	install -Dm644 contrib/usblcd-dashboard.service \
 		$(DESTDIR)/etc/systemd/system/usblcd-dashboard.service
-	@echo "then: sudo systemctl daemon-reload && sudo systemctl enable --now usblcd-dashboard.service"
+	# the unit file is written here, so systemd has to be told to re-read it:
+	# a restart without daemon-reload keeps running the OLD Environment= lines
+	# (which is how a new PAGES= list silently never arrives)
+	@echo "first time: sudo systemctl daemon-reload && sudo systemctl enable --now usblcd-dashboard.service"
+	@echo "reinstall:  sudo systemctl daemon-reload && sudo systemctl restart usblcd-dashboard.service"
 	@echo "tune: sudo mkdir -p /etc/usblcd && sudo $${EDITOR:-nano} /etc/usblcd/dashboard.conf"
+	@echo "AI page on a service box: sudo sh -c 'umask 077; python3 $(PREFIX)/tools/strata_conf.py >> /etc/usblcd/dashboard.conf'"
+	@echo "          (then the same daemon-reload/restart pair; that file holds a secret)"
 
 uninstall:
 	rm -f $(DESTDIR)/usr/local/bin/$(BIN)

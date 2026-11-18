@@ -341,9 +341,15 @@ journalctl -u usblcd-dashboard -f       # layout/write reports land here
 ```
 
 `make install-service` copies `dash/`, `vendor/`, `build/` (the `ttfplan`
-helper), `fonts/` and the README to `/opt/usblcd`, and installs
-`contrib/usblcd-dashboard.service` as `/etc/systemd/system/usblcd-dashboard.service`.
-It does not enable anything itself — run the `systemctl` lines above.
+helper), `fonts/`, `tools/strata_conf.py` and the README to `/opt/usblcd`, and
+installs `contrib/usblcd-dashboard.service` as
+`/etc/systemd/system/usblcd-dashboard.service`.  It does not enable anything
+itself, and it does not reload systemd — `daemon-reload` is the step people skip,
+and it is the one that matters: the unit file is rewritten by that target, so a
+restart without the reload keeps running the **old** `Environment=` lines (which
+is how a new `PAGES=` list silently never arrives, and how the AI page looks like
+it was added and is not).  Run the `systemctl` lines above, every time you
+reinstall.
 
 Tune it without editing the unit: `/etc/usblcd/dashboard.conf` overrides
 `TITLE`, `PAGES` (`CPU,GPU,PROC,AI`), `PAGE_SECONDS`, `INTERVAL`, `WEIGHT`,
@@ -407,13 +413,16 @@ AI page uses, so there is nothing to copy by hand:
 ```sh
 python3 tools/strata_conf.py --check                       # what it would write, and proof it answers
 sudo sh -c 'umask 077; python3 tools/strata_conf.py >> /etc/usblcd/dashboard.conf'
-sudo systemctl restart usblcd-dashboard
+sudo systemctl restart usblcd-dashboard                    # the conf file is read at every start
 ```
 
 It prints `STRATA_URL=` / `STRATA_API_KEY=` lines only (never a half-config: it
 exits 1 and writes nothing when it finds no server), `--url`/`--key` override the
 discovery, and `--state` reads another login's state tree.  `make install-service`
-copies `dash/`, not `tools/`, so run it from the project directory.
+copies it to `/opt/usblcd/tools/strata_conf.py` as well, so a service box can run
+it from there.  A conf-file change needs only a restart; a **reinstall** (which
+rewrites the unit) needs `sudo systemctl daemon-reload` first — see the note
+above.
 
 ## Capture pipelines (`feed`)
 

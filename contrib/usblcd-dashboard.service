@@ -5,10 +5,16 @@
 # Install (from the project directory):
 #
 #   sudo make install install-udev      # usblcd + non-root panel access
-#   sudo make service                   # /opt/usblcd + this unit, enabled
+#   sudo make install-service           # /opt/usblcd + this unit
+#   sudo systemctl daemon-reload        # REQUIRED after any install: this unit file is
+#                                       # written by that target, and without the reload
+#                                       # systemd keeps running the old Environment= lines
+#   sudo systemctl enable --now usblcd-dashboard.service
 #
 # Tune it without editing the unit: create /etc/usblcd/dashboard.conf with any
-# of the keys below (all optional), then `systemctl restart usblcd-dashboard`.
+# of the keys below (all optional), then `systemctl restart usblcd-dashboard`
+# (this file is read at every start, so a restart is enough for it; the reload
+# is only needed when the unit file itself changed).
 #
 #   TITLE=myhost           header title (empty = the machine hostname)
 #   PAGES=CPU,GPU,PROC,AI  pages to rotate; a single page pins the panel
