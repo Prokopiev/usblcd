@@ -9,34 +9,40 @@ libusb.
 
     dash.py --once                      # one frame to /tmp/usblcd-dashboard.ppm
     dash.py --sensors                   # what was discovered on this box (debug)
-    dash.py --page CPU                  # pin a page; default rotates CPU/GPU/PROC
+    dash.py --page CPU                  # pin a page; default rotates CPU/GPU/PROC/AI
+    dash.py --page AI                   # the inference server's Overview
     dash.py --exec ./usblcd             # live: one frame/s onto the panel
     dash.py --raw | usblcd feed         # same, with a pipeline you own
     dash.py --font-sample --out s.ppm   # draw the whole font sheet
 
-Sensors come from hwmon, /proc, statvfs and nvidia-smi.  nvidia-smi runs in a
-background thread so a slow query can never stall a frame, and it is retried
-with a backoff for as long as the dashboard runs: a driver that boots after
-this service, a GPU mid-reset and a driver mid-upgrade all heal on their own,
-so the GPU page fills itself in.  Every section is guarded on its own: a
-missing sensor drops its panel, it does not stop the frame.
+Sensors come from hwmon, /proc, statvfs, nvidia-smi and the strata inference
+server's /metrics.  nvidia-smi runs in a background thread so a slow query can
+never stall a frame, and it is retried with a backoff for as long as the
+dashboard runs: a driver that boots after this service, a GPU mid-reset and a
+driver mid-upgrade all heal on their own, so the GPU page fills itself in.  The
+AI page polls the same /metrics the strata monitor's Overview reads, with the
+same poll rules.  Every section is guarded on its own: a missing sensor drops
+its panel, it does not stop the frame.
 """
 from __future__ import annotations
 
 import argparse
 import glob
+import json
 import math
 import os
+import pwd
 import re
 import shutil
 import socket
 import struct
 import subprocess
 import sys
-from array import array
 import threading
 import time
-import re
+import urllib.error
+import urllib.request
+from array import array
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from font57 import FONT, glyph                                # noqa: E402
@@ -608,15 +614,427 @@ class GPUThread(threading.Thread):
             self.stop.wait(self.period)       # also the fastest way out
 
 
+# ── strata inference server (/metrics, in a background thread) ─────────
+def sudo_login_state():
+    """The strata state of the login that typed `sudo`, when running under sudo.
+
+    `sudo python3 tools/strata_conf.py` and `sudo dash.py` run as root, and root
+    has no strata install: the model belongs to the login that typed sudo, and
+    only root can read that login's 0600 launch configs.  Without this, the one
+    command that writes the service's STRATA_URL/STRATA_API_KEY pair looks in
+    /root, finds nothing, and refuses to write anything.
+    """
+    user = os.environ.get('SUDO_USER')
+    if not user or user == 'root':
+        return ''
+    try:
+        home = pwd.getpwnam(user).pw_dir
+    except KeyError:
+        home = '/home/%s' % user
+    return os.path.join(home, '.local', 'state', 'strata')
+
+
+def strata_state_dirs(extra=None):
+    """Directories a strata install writes its runtime state into.
+
+    `strata` writes its launch configs (port + the API key /metrics answers 401
+    without) to $XDG_STATE_HOME/strata/launch and the URL a running server
+    bound to to .../strata/runtime, defaulting under the user's home.  The
+    dashboard service runs as a dedicated user with ProtectHome=read-only, so
+    on a service box the state of *your* login is not under $HOME: STRATA_STATE
+    (or --strata-state) is how you point the poller at it.
+    """
+    out = []
+    for cand in ([extra] if extra else []):
+        if cand:
+            out.append(os.path.expanduser(cand))
+    env = os.environ.get('STRATA_STATE')
+    if env:
+        out.append(os.path.expanduser(env))
+    sudo = sudo_login_state()
+    if sudo:
+        out.append(sudo)
+    base = os.environ.get('XDG_STATE_HOME')
+    if not base:
+        base = os.path.join(os.path.expanduser('~'), '.local', 'state')
+    out.append(os.path.join(base, 'strata'))
+    home = os.path.expanduser('~')
+    if home not in ('/', ''):
+        out.append(os.path.join(home, '.strata'))
+    seen = []
+    for p in out:
+        if p not in seen:
+            seen.append(p)
+    return seen
+
+
+def _read_json(path):
+    try:
+        with open(path, 'rb') as f:
+            d = json.loads(f.read().decode('utf-8', 'replace'))
+    except (OSError, ValueError):
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def strata_endpoints(state_dirs=None):
+    """[(url, key, note)] for every local strata server this box describes.
+
+    The launch config the setup writes carries the port and the API key, the
+    ready file the running server writes carries the URL it actually bound; a
+    config whose server is not up is still listed (the page then says the server
+    is not answering, which is the truth, and heals when it starts).  Newest
+    config first: a box that has launched two models keeps both files, and the
+    model you started last is the one you want on the panel.
+    """
+    out = []
+    for state in (state_dirs or strata_state_dirs()):
+        ready = []
+        for p in sorted(glob.glob(os.path.join(state, 'runtime', '*ready.json'))):
+            d = _read_json(p)
+            url, port = d.get('api_url'), d.get('bound_port')
+            if url and port:
+                ready.append((str(url).rstrip('/'), int(port), p))
+        configs = []
+        paths = glob.glob(os.path.join(state, 'launch', '*.json'))
+        for p in sorted(paths, key=lambda q: os.path.getmtime(q) if os.path.exists(q) else 0,
+                        reverse=True):
+            d = _read_json(p)
+            if d.get('api_key') and d.get('port'):
+                configs.append((int(d['port']), str(d['api_key']),
+                                str(d.get('model_name') or ''), p))
+        for url, port, rp in ready:
+            for cport, key, model, cp in configs:
+                if cport == port:
+                    out.append((url, key, model or os.path.basename(cp)))
+                    break
+        for port, key, model, cp in configs:
+            # a config with no ready file: the server is not running right now,
+            # so poll the address the config says it would use
+            if not any(u.endswith(':%d' % port) for u, _, _ in out):
+                host = '127.0.0.1'
+                out.append(('http://%s:%d' % (host, port), key, model or 'launch/%s' %
+                            os.path.basename(cp)))
+    env_url = os.environ.get('STRATA_URL')
+    if env_url:
+        out.insert(0, (env_url.rstrip('/'), os.environ.get('STRATA_API_KEY') or '', 'STRATA_URL'))
+    uniq = []
+    for e in out:
+        if e not in uniq:
+            uniq.append(e)
+    return uniq
+
+
+def query_strata(url, key, timeout=3.0):
+    """(metrics, '') on a good reply, (None, one-line reason) otherwise.
+
+    The reason is what the AI page shows when it has nothing to draw, so the
+    three cases stay distinguishable on the glass: a server that is not
+    listening, a server that answers and refuses the key (401: the key file
+    moved, which heals when the config is re-read), and a reply that is not the
+    metrics document at all.
+    """
+    req = urllib.request.Request(url.rstrip('/') + '/metrics')
+    if key:
+        req.add_header('Authorization', 'Bearer %s' % key)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = r.read()
+    except urllib.error.HTTPError as e:
+        # 401/403 is the key, 404 is an old server with no /metrics at all
+        return None, 'HTTP %d %s' % (e.code, (e.reason or '')[:40])
+    except urllib.error.URLError as e:
+        why = e.reason
+        why = (why.strerror if hasattr(why, 'strerror') else str(why)) or 'unreachable'
+        return None, 'no server answering (%s)' % str(why)[:48]
+    except (OSError, ValueError, TimeoutError) as e:
+        return None, 'request failed (%s)' % (e.strerror if hasattr(e, 'strerror')
+                                              else e.__class__.__name__)
+    try:
+        d = json.loads(body.decode('utf-8', 'replace'))
+    except ValueError:
+        return None, 'reply is not JSON'
+    if not isinstance(d, dict) or not isinstance(d.get('live'), dict):
+        return None, 'reply has no live block (not a strata metrics document)'
+    return d, ''
+
+
+class StrataThread(threading.Thread):
+    """The strata server's /metrics, polled in the background.
+
+    The same rules the GPU poller learned the hard way apply here, and for the
+    same reason: this dashboard starts at boot, long before the inference
+    server is up, and a model load takes minutes.  A failure is therefore never
+    fatal and never the end of polling -- the poll backs off (3, 6, 12, 24, 30s,
+    then 2min) and the first good reply lights the page back up by itself.  A
+    box with no strata state on disk is the one case with nothing to poll, and
+    even that is re-checked slowly: `strata launch` writes its config later.
+
+    Nothing is started, installed or written here -- the poller only reads the
+    state files a strata install already owns and issues GET /metrics.
+
+    `stale()` is seconds since the last good reply: the page keeps painting the
+    numbers it last had and marks them stale.
+    """
+
+    MAX_PERIOD = 30.0
+    SLOW_AFTER = 24
+    SLOW_PERIOD = 120.0
+
+    def __init__(self, url=None, key=None, state=None, period=2.0, timeout=3.0):
+        super().__init__(daemon=True)
+        self.base = self.period = period
+        self.timeout = timeout
+        self.stop = threading.Event()
+        self.metrics = None
+        self.fail = 0
+        self.why = 'probing'
+        self.source = ''
+        self.good_at = 0.0
+        self.state = state
+        self.endpoints = [(url, key or os.environ.get('STRATA_API_KEY') or '', '--strata-url')]
+        if not url:
+            self.endpoints = strata_endpoints(strata_state_dirs(state))
+        self.pinned = None
+        self.server = ''
+        self.i = 0
+
+    def stale(self):
+        """Seconds since the last good reply, or None if there never was one."""
+        return (time.monotonic() - self.good_at) if self.good_at else None
+
+    def next_endpoint(self):
+        if self.pinned is not None:
+            return self.pinned
+        if not self.endpoints:
+            return None
+        self.pinned = self.endpoints[self.i % len(self.endpoints)]
+        return self.pinned
+
+    def backoff(self):
+        if self.fail >= self.SLOW_AFTER:
+            self.period = self.SLOW_PERIOD
+        else:
+            self.period = min(self.MAX_PERIOD, self.base * 2 ** min(self.fail - 1, 4))
+
+    def run(self):
+        while not self.stop.is_set():
+            ep = self.next_endpoint()
+            if ep is None:
+                # nothing on disk to ask: keep looking, a strata install writes
+                # its config whenever the model is (re)launched
+                self.fail += 1
+                self.why = 'no local strata server configured'
+                self.backoff()
+                self.stop.wait(self.period)
+                self.endpoints = strata_endpoints(strata_state_dirs(self.state))
+                continue
+            url, key, note = ep
+            d, why = query_strata(url, key, self.timeout)
+            if d is not None:
+                self.metrics, self.fail, self.why, self.source = d, 0, '', note
+                self.server = url
+                self.good_at = time.monotonic()
+                self.period = self.base
+            else:
+                self.fail += 1
+                self.why = why
+                self.backoff()
+                if self.pinned is not None:
+                    self.i += 1           # a box with two models: try the other one
+                    self.pinned = None
+            self.stop.wait(self.period)   # also the fastest way out
+
+
+def snum(v):
+    """float for a real number; None for anything the server reports as absent.
+
+    The Overview's rule, copied: a number the server did not report is drawn as
+    '--', never as an invented zero, because a zero on a dashboard reads as 'a
+    zero was measured'.
+    """
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    v = float(v)
+    if v != v or v in (float('inf'), float('-inf')):
+        return None
+    return v
+
+
+def sseries(history, key, scale=1.0, n=60):
+    """One of the server's own minute-of-history series, as plain floats."""
+    raw = history.get(key) if isinstance(history, dict) else None
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for x in raw[-n:]:
+        v = snum(x)
+        out.append(None if v is None else v / scale)
+    return out
+
+
+def tok_s(r):
+    """A request's decode speed, from its own reported rate or its token/ms."""
+    if not isinstance(r, dict):
+        return None
+    v = snum(r.get('decode_tok_s'))
+    if v is not None:
+        return v
+    out, ms = snum(r.get('output_tokens')), snum(r.get('decode_ms'))
+    return round(out / (ms / 1000.0), 1) if out and out >= 2 and ms and ms > 0 else None
+
+
+def strata_view(d):
+    """The monitor Overview's numbers (view 1), from one /metrics reply.
+
+    Field for field what `strata monitor`' first view shows: the model state and
+    its progress, the eight tiles (speed, GPU load, VRAM, GPU temp, power, PCIe,
+    CPU, disk) with the server's own history for the sparklines, the three bars
+    (context fill, experts in VRAM, system RAM) and the recent requests.  With
+    two cards, the tiles say what the Overview says: the busiest card's load, the
+    hottest card's temp, all the memory and all the watts together.
+    """
+    if not isinstance(d, dict) or not isinstance(d.get('live'), dict):
+        return None
+    live = d['live']
+    eng = d.get('engine') if isinstance(d.get('engine'), dict) else {}
+    hw = d.get('hardware') if isinstance(d.get('hardware'), dict) else {}
+    stat = d.get('hardware_static') if isinstance(d.get('hardware_static'), dict) else {}
+    hist = d.get('history') if isinstance(d.get('history'), dict) else {}
+    totals = d.get('totals') if isinstance(d.get('totals'), dict) else {}
+    reqs = [r for r in (d.get('requests') or []) if isinstance(r, dict)]
+
+    raw = str(live.get('state') or 'idle')
+    queued = int(snum(live.get('queued')) or 0)
+    if eng.get('error') or raw == 'error':
+        state = 'Error'
+    elif raw == 'reading':
+        state = 'Reading'
+    elif raw == 'generating':
+        state = 'Generating'
+    elif queued > 0 and raw not in ('reading', 'generating'):
+        state = 'Queued'
+    else:
+        state = 'Idle'
+
+    gen, maxtok = snum(live.get('generated')), snum(live.get('max_tokens'))
+    pread, ptotal = snum(live.get('prompt_read')), snum(live.get('prompt_total'))
+    last = reqs[0] if reqs else {}
+    if state == 'Reading' and ptotal:
+        done, total = pread or 0.0, ptotal
+    elif state == 'Generating' and maxtok:
+        done, total = gen or 0.0, maxtok
+    else:
+        done, total = None, None
+
+    ctx_max = snum(eng.get('max_context'))
+    pt, po = snum(live.get('prompt_tokens')), gen
+    out_last, pr_last = snum(last.get('output_tokens')), snum(last.get('prompt_tokens'))
+    if state in ('Reading', 'Generating') and pt is not None and po is not None:
+        used = pt + po
+    elif pr_last is not None and out_last is not None:
+        used = pr_last + out_last            # idle: the last request's fill, like the Overview
+    else:
+        used = None
+
+    if state == 'Generating' and snum(live.get('tok_s')) is not None:
+        speed, note = snum(live.get('tok_s')), 'generating now'
+    elif state == 'Reading' and snum(live.get('prefill_tok_s_mean')) is not None:
+        speed, note = snum(live.get('prefill_tok_s_mean')), 'reading the prompt'
+    else:
+        # idle: the run's token-weighted average, not the last request's speed
+        out, ms = snum(totals.get('output_tokens')), snum(totals.get('decode_ms'))
+        speed = round(out / (ms / 1000.0), 1) if out and out >= 2 and ms and ms > 0 else None
+        note = 'run average'
+        if speed is None:
+            speed, note = tok_s(last), 'last request'
+
+    cards = [c for c in (hw.get('gpus') or []) if isinstance(c, dict)]
+
+    def top(vals):
+        vals = [v for v in vals if v is not None]
+        return max(vals) if vals else None
+
+    def summ(vals):
+        vals = [v for v in vals if v is not None]
+        return sum(vals) if vals else None
+
+    util = top([c.get('util') for c in cards]) if cards else snum(hw.get('gpu_util'))
+    v_used = summ([c.get('mem_used') for c in cards]) if cards else snum(hw.get('gpu_mem_used'))
+    v_total = summ([c.get('mem_total') for c in cards]) if cards else snum(hw.get('gpu_mem_total'))
+    temp = top([c.get('temp') for c in cards]) if cards else snum(hw.get('gpu_temp'))
+    power = summ([c.get('power') for c in cards]) if cards else snum(hw.get('gpu_power'))
+    # the per-card rows do not always carry a power limit, so the whole-computer
+    # reading is the fallback (a limit of '--' would leave the tile with no scale)
+    plimit = summ([c.get('power_limit') for c in cards])
+    if plimit is None:
+        plimit = snum(hw.get('gpu_power_limit'))
+    vram_hist = sseries(hist, 'gpu_mem_used', 2 ** 30)
+    if len(cards) > 1:
+        # the server keeps a history of its first card only: a flat line for all
+        # cards is honest, a summed history built from one card is not
+        vram_hist = [v_used] * 60 if v_used is not None else []
+
+    return {
+        'model': eng.get('model') or stat.get('model') or '',
+        'state': state, 'queued': queued, 'phase': live.get('phase') or '',
+        'progress': (done, total), 'ctx': (used, ctx_max),
+        'speed': (speed, note), 'speed_hist': sseries(hist, 'tok_s'),
+        'gpus': len(cards) if cards else int(snum(stat.get('gpu_count')) or 0),
+        'gpu_name': stat.get('gpu_name') or '',
+        'util': util, 'util_hist': sseries(hist, 'gpu_util'),
+        'vram': (v_used / 2 ** 30 if v_used is not None else None,
+                 v_total / 2 ** 30 if v_total is not None else None),
+        'vram_hist': vram_hist,
+        'temp': temp, 'temp_hist': sseries(hist, 'gpu_temp'),
+        'power': (power, plimit), 'power_hist': sseries(hist, 'gpu_power'),
+        'pcie': (snum(hw.get('gpu_pcie_rx_mb')),
+                 snum(hw.get('gpu_pcie_gen')) or snum(hw.get('gpu_pcie_gen_max')),
+                 snum(hw.get('gpu_pcie_width'))),
+        'pcie_hist': sseries(hist, 'gpu_pcie_rx_mb'),
+        'cpu': snum(hw.get('cpu_pct')) if hw.get('cpu_pct') is not None else snum(hw.get('cpu')),
+        'cpu_hist': sseries(hist, 'cpu'),
+        'cores': int(snum(stat.get('cores')) or 0),
+        'disk': (snum(hw.get('disk_read_mb')), snum(hw.get('disk_write_mb'))),
+        'disk_hist': sseries(hist, 'disk_read_mb'),
+        'ram': (snum(hw.get('ram_used')), snum(hw.get('ram_total'))),
+        'experts': (snum(eng.get('expert_slots')), snum(eng.get('experts')),
+                    snum(eng.get('expert_cache_mib'))),
+        'totals': {k: snum(totals.get(k)) for k in ('requests', 'prompt_tokens',
+                                                   'output_tokens', 'reused')},
+        'recent': [{'tps': tok_s(r), 'prompt': snum(r.get('prompt_tokens')),
+                    'reused': snum(r.get('reused')),
+                    'hit': snum(r.get('hit_rate')),
+                    'output': snum(r.get('output_tokens')),
+                    'dur': snum(r.get('duration_s')),
+                    'finish': str(r.get('finish') or r.get('finish_reason') or ''),
+                    'error': bool(r.get('error'))} for r in reqs[:8]],
+        'sampled_at': snum(d.get('time')),
+    }
+
+
+def fmt_tok(v):
+    return '--' if v is None else '%s' % format(int(round(v)), ',d')
+
+
+def fmt_k(v):
+    """262144 -> '262K': the Overview's context label, in the panel's font."""
+    return '--' if v is None else ('%dK' % int(round(v / 1024.0)) if v >= 1024
+                                   else '%d' % int(round(v)))
+
+
 # ── metrics ────────────────────────────────────────────────────────────
 class Metrics:
-    def __init__(self, gpu=True, history=180, interval=1.0):
+    def __init__(self, gpu=True, history=180, interval=1.0, strata=True,
+                 strata_url=None, strata_key=None, strata_state=None):
         self.interval = interval
         self.hist = history
         self.hist_cpu = [0.0] * history
         self.hist_temp = [0.0] * history
         self.hist_net = [0.0] * history
         self.gpu_thread = GPUThread() if gpu else None
+        self.strata_thread = StrataThread(url=strata_url, key=strata_key,
+                                          state=strata_state) if strata else None
         self.sensors = scan_hwmon()
         self.host = socket.gethostname()
         self.ip = ''
@@ -633,6 +1051,8 @@ class Metrics:
         self._prev_t = time.time()
         self.gpu = None
         self.hist_gpu = []          # per-GPU {'util':[], 'temp':[]}
+        self.strata = None          # last /metrics reply (the AI page's source)
+        self.strata_age = None      # seconds since that reply, None: never had one
         self.net = {}
         self.disks = []
         self.mem = {'total': 0, 'used': 0, 'swap_total': 0, 'swap_used': 0}
@@ -886,6 +1306,11 @@ class Metrics:
 
         if self.gpu_thread is not None:
             self.gpu = self.gpu_thread.gpus
+        if self.strata_thread is not None:
+            # a failed poll leaves the last reply in place: the page keeps its
+            # numbers and marks their age, exactly like the GPU page
+            self.strata = self.strata_thread.metrics
+            self.strata_age = self.strata_thread.stale()
         while len(self.hist_gpu) < len(self.gpu or []):
             self.hist_gpu.append({'util': [0.0] * self.hist, 'temp': [0.0] * self.hist})
         for i, g in enumerate(self.gpu or []):
@@ -906,6 +1331,8 @@ class Metrics:
     def shutdown(self):
         if self.gpu_thread is not None:
             self.gpu_thread.stop.set()
+        if self.strata_thread is not None:
+            self.strata_thread.stop.set()
 
 
 # ── formatting helpers ─────────────────────────────────────────────────
@@ -1031,8 +1458,9 @@ def band(c):
 
 
 # ── layout: header + paged bodies ──────────────────────────────────────
-PAGES = ('CPU', 'GPU', 'PROC')          # GPU = all GPUs side by side
+PAGES = ('CPU', 'GPU', 'PROC', 'AI')   # GPU = all GPUs side by side
 # GPU1..GPU9 pin one GPU to the whole screen (name fits, histories are huge)
+# AI = the strata monitor's Overview (view 1), read from the server's /metrics
 
 
 def debug_grid(c, args):
@@ -1569,6 +1997,224 @@ def body_proc(c, m, args, y0, h):
         c.text_right(rx + rw - 8, yy, v, 2, TEXT)
 
 
+# ── page 4: AI -- the strata monitor's Overview (view 1) ────────────────
+AI_PHASE = {'Idle': 'IDLE, NO REQUEST', 'Reading': 'READING PROMPT',
+            'Generating': 'GENERATING A REPLY', 'Queued': 'REQUESTS QUEUED',
+            'Error': 'MODEL UNAVAILABLE'}
+AI_STATE_COLOR = {'Idle': DIM, 'Reading': ACCENT, 'Generating': ACCENT,
+                  'Queued': WARN, 'Error': CRIT}
+AI_FINISH = {'stop': 'DONE', 'length': 'CAPPED', 'tool_calls': 'TOOLS',
+             'cancelled': 'GONE', 'aborted': 'GONE', 'error': 'ERROR'}
+
+
+def sfmt(v, digits=0):
+    return '--' if v is None else '%.*f' % (digits, v)
+
+
+def ai_hi(series, floor):
+    """Top of a sparkline's range: the data's own max, or a floor when it is empty."""
+    vals = [x for x in (series or []) if x is not None]
+    return max(floor, (max(vals) if vals else 0.0) * 1.1)
+
+
+def ai_tile(c, x, y, w, h, title, foot, big, unit, series, lo, hi, color):
+    """One Overview tile: a big number, a caption, and the server's own history.
+
+    The histories come in the /metrics reply (a minute per series), so the AI
+    page draws the same curve `strata monitor` draws instead of building its own
+    ring buffer out of a 1 fps poll."""
+    ix, iy = panel(c, x, y, w, h, title, None)
+    sc = pick_scale(c, big, (5, 4, 3), max(20, w - 16 - c.text_w(unit, 3) - 10))
+    c.text(ix, iy, big, sc, color)
+    c.text(ix + c.text_w(big, sc) + 8,
+           iy + (c.text_h(sc) - c.text_h(3)) // 2, unit, 3, DIM)
+    row = iy + max(c.text_h(sc), c.text_h(3)) + 5
+    c.text(ix, row, ellipsize(c, foot, 1, w - 16), 1, DIM)
+    top = row + c.text_h(1) + 6
+    gw = w - 16
+    sh = (y + h - 8) - top
+    if sh < 12:
+        return
+    vals = [v for v in (series or []) if v is not None]
+    if len(vals) >= 2 and hi > lo:
+        c.spark(ix, top, gw, sh, vals, lo, hi, color)
+    else:
+        c.text(ix, top, ellipsize(c, 'no history in the reply', 1, gw), 1, DIM)
+
+
+def body_ai(c, m, args, y0, h):
+    W = c.w
+    th = m.strata_thread
+    d = m.strata
+    stale = th.stale() if th is not None else None
+    state_dir = getattr(args, 'strata_state', None)
+    if d is None:
+        # an empty AI page has the same four causes as an empty GPU page, and
+        # they need four messages: --no-strata (asked for), nothing on disk to
+        # poll (this box runs no strata server), a server that is not answering
+        # (it boots after this service, and it heals), and a reply that stopped
+        sub, head, col = 'no /metrics reply', 'SERVER NOT ANSWERING', CRIT
+        rows = []
+        if th is None:
+            sub, head, col = 'queries disabled', 'AI PAGE DISABLED', DIM
+            rows = ['this run has --no-strata']
+        elif not th.endpoints:
+            sub, head, col = 'nothing to poll', 'NO STRATA SERVER', DIM
+            rows = ['looked in  ' + '  '.join(strata_state_dirs(state_dir)),
+                    'strata launch,  STRATA_URL + STRATA_API_KEY,  dash.py --strata-url']
+        elif stale is None:
+            head, col = 'PROBING THE STRATA SERVER', WARN
+            rows = ['attempt %d, next try in %.0fs -- the server boots after this service'
+                    % (th.fail, th.period), th.why]
+        else:
+            rows = ['last good reply %.0fs ago, next try in %.0fs' % (stale, th.period),
+                    th.why]
+        rows.append('strata status --json   /   dash.py --sensors')
+        panel(c, 8, y0, W - 16, h, 'AI', sub)
+        c.text(16, y0 + 40, ellipsize(c, head, 3, W - 32), 3, col)
+        y = y0 + 40 + c.text_h(3) + 12
+        for s in rows:
+            if y + c.text_h(2) > y0 + h - 8:
+                break
+            c.text(16, y, ellipsize(c, s, 2, W - 32), 2, DIM)
+            y += c.text_h(2) + 8
+        return
+
+    v = strata_view(d)
+    if v is None:
+        panel(c, 8, y0, W - 16, h, 'AI', 'no live block in the reply')
+        c.text(16, y0 + 40, ellipsize(c, 'NOT A STRATA METRICS REPLY', 3, W - 32), 3, CRIT)
+        c.text(16, y0 + 40 + c.text_h(3) + 12,
+               ellipsize(c, 'GET %s/metrics  ->  {live: ...}' %
+                         (th.source if th is not None else 'server'), 2, W - 32), 2, DIM)
+        return
+
+    # ── model state bar (the Overview's heading + state strip) ────────────
+    strip = 96
+    state = v['state']
+    scol = AI_STATE_COLOR[state]
+    marker = 'LIVE' if stale is None or stale <= 6.0 else 'STALE %.0fs' % stale
+    used, ctx_max = v['ctx']
+    sub = '%s  %s  %s' % (v['model'] or 'model', fmt_k(ctx_max), marker)
+    ix, iy = panel(c, 8, y0, W - 16, strip, 'MODEL', sub)
+    x0, w0 = 8, W - 16
+    done, total = v['progress']
+    pct = int(round(100.0 * done / total)) if done is not None and total else None
+    if pct is not None:
+        right = '%s / %s TOK  %d%%' % (fmt_tok(done), fmt_tok(total), pct)
+    elif v['queued']:
+        right = '%d QUEUED' % v['queued']
+    else:
+        right = '%s TOK OUT  %s REQ' % (fmt_tok(v['totals'].get('output_tokens')),
+                                        fmt_tok(v['totals'].get('requests')))
+    phase = AI_PHASE[state] + ('  %s' % v['phase'].upper() if v['phase'] else '')
+    sc = pick_scale(c, phase, (4, 3, 2),
+                    max(40, w0 - 16 - c.text_w(right, 3) - 20))
+    c.text(ix, iy, phase, sc, scol)
+    c.text_right(x0 + w0 - 8, iy + (c.text_h(sc) - c.text_h(3)) // 2, right, 3, TEXT)
+    yy = iy + c.text_h(sc) + 6
+    url = (th.server if th is not None else '') or ''
+    line2 = 'SERVER %s   CTX %s / %s   STATE %s   %s' % (
+        ellipsize(c, url.replace('http://', ''), 1, 320), fmt_k(used), fmt_k(ctx_max),
+        state, marker)
+    c.text(ix, yy, ellipsize(c, line2, 1, w0 - 16), 1, DIM)
+
+    # ── the Overview's eight tiles, with the server's own histories ──────
+    ty = y0 + strip + 8
+    tile_h = 110
+    cols = 4
+    col = (W - 16 - 8 * (cols - 1)) // cols
+    vu, vt = v['vram']
+    pw, pl = v['power']
+    rx, pgen, pwidth = v['pcie']
+    slots, slots_total, slots_mib = v['experts']
+    speed, note = v['speed']
+    note = {'run average': 'AVG OF THE RUN', 'generating now': 'GENERATING NOW',
+            'reading the prompt': 'PREFILL NOW', 'last request': 'LAST REQUEST'}.get(note,
+                                                                                       'NO RATE')
+    cards_note = ('BUSIEST OF %d CARDS' % v['gpus']) if v['gpus'] > 1 else 'THE ONLY CARD'
+    hot_note = ('HOTTEST OF %d CARDS' % v['gpus']) if v['gpus'] > 1 else 'THE ONLY CARD'
+    tiles = [
+        ('SPEED', sfmt(speed, 0), 'T/S', note, v['speed_hist'],
+         0, ai_hi(v['speed_hist'], 50), ACCENT),
+        ('GPU LOAD', sfmt(v['util']), '%', cards_note,
+         v['util_hist'], 0, 100, ACCENT),
+        ('VRAM', sfmt(vu, 1), 'GB',
+         '%.0f%% OF %.1f GB' % (100.0 * vu / vt, vt) if vu is not None and vt else '-- OF -- GB',
+         v['vram_hist'], 0, max(vt or 0.0, vu or 0.0) * 1.05, WARN),
+        ('GPU TEMP', sfmt(v['temp']), 'C', hot_note, v['temp_hist'],
+         0, ai_hi(v['temp_hist'], 95), temp_color(v['temp'])),
+        ('POWER', sfmt(pw), 'W',
+         '%.0f%% OF %.0f W' % (100.0 * pw / pl, pl) if pw is not None and pl else 'OF -- W',
+         v['power_hist'], 0, max(pl or 0.0, ai_hi(v['power_hist'], 100)), OK),
+        ('PCIE RX', sfmt(rx), 'MB/S',
+         'GEN %s x%s' % (sfmt(pgen), sfmt(pwidth)), v['pcie_hist'],
+         0, ai_hi(v['pcie_hist'], 100), OK),
+        ('CPU', sfmt(v['cpu']), '%', 'HOST CPU, %d CORES' % max(0, v['cores']),
+         v['cpu_hist'], 0, 100, OK),
+        ('DISK READ', sfmt(v['disk'][0], 1), 'MB/S',
+         'WRITE %s MB/S' % sfmt(v['disk'][1], 1), v['disk_hist'],
+         0, ai_hi(v['disk_hist'], 10), TEXT),
+    ]
+    for i, (title, big, unit, foot, series, lo, hi, col_c) in enumerate(tiles):
+        r, k = divmod(i, cols)
+        ai_tile(c, 8 + k * (col + 8), ty + r * (tile_h + 8), col, tile_h,
+                title, foot, big, unit, series, lo, hi, col_c)
+
+    # ── the Overview's three bars (context, experts, RAM) + recent requests
+    by = ty + 2 * (tile_h + 8)
+    bh = (y0 + h) - by
+    lw = 420
+    ix, iy = panel(c, 8, by, lw, bh, 'FILL',
+                   '%s REQ  %s TOK IN' % (fmt_tok(v['totals'].get('requests')),
+                                          fmt_tok(v['totals'].get('prompt_tokens'))))
+    ru, rt = v['ram']
+    bars = [('CONTEXT', used, ctx_max, '%s / %s TOK' % (fmt_k(used), fmt_k(ctx_max)),
+             ACCENT if used is None or not ctx_max or used / ctx_max < 0.85 else WARN),
+            ('EXPERTS IN VRAM', slots, slots_total,
+             '%s SLOTS  %.1f GB' % (fmt_tok(slots), (slots_mib or 0) / 1024.0), ACCENT),
+            ('SYSTEM RAM', ru, rt, '%.1f / %.1f GB' % ((ru or 0) / 2 ** 30, (rt or 0) / 2 ** 30),
+             WARN if ru is not None and rt and ru / rt >= 0.85 else OK)]
+    pitch = (bh - band(c) - 10) // max(1, len(bars))
+    for i, (lab, u, t, txt, colr) in enumerate(bars):
+        yy = iy + i * pitch
+        c.text(ix, yy, ellipsize(c, '%s  %s' % (lab, txt), 1, lw - 16), 1, DIM)
+        frac = (u / t) if (u is not None and t) else 0.0
+        c.bar(ix, yy + c.text_h(1) + 3, lw - 16, max(6, min(12, pitch - c.text_h(1) - 6)),
+              frac, colr)
+
+    rx0, rw = 8 + lw + 8, W - 16 - lw - 8
+    pitch = max(12, c.text_h(1) + 10)
+    fit = max(1, (by + bh - 8 - (by + band(c))) // pitch)
+    ix, iy = panel(c, rx0, by, rw, bh, 'RECENT',
+                   'LAST %d OF %d' % (fit, len(v['recent'])))
+    pitch = max(12, c.text_h(1) + 10)
+    shown = v['recent'][:fit]
+    if len(v['recent']) > fit:
+        c.info.append('RECENT shows %d of %d rows at this font size' % (fit, len(v['recent'])))
+    for i, r in enumerate(shown):
+        hit = r['hit']
+        cells = [('IN', fmt_tok(r['prompt']), TEXT),
+                 ('HIT', '--' if hit is None else '%3.0f%%' % (hit * 100.0),
+                  OK if hit is not None and hit >= 0.5 else WARN),
+                 ('OUT', fmt_tok(r['output']), TEXT),
+                 ('T/S', sfmt(r['tps'], 1), ACCENT),
+                 ('TIME', '%s S' % sfmt(r['dur'], 1), TEXT),
+                 ('END', ('ERROR' if r['error'] else AI_FINISH.get(r['finish'], 'DONE')).upper(),
+                  CRIT if r['error'] else DIM)]
+        # the row is a fixed set of cells, not a joined string: drop the tail
+        # cells that no longer fit (biggest prompt token count decides the row),
+        # never the font size, and say what had to go
+        room, dropped = rw - 16, 0
+        while len(cells) > 2 and sum(c.text_w(lab, 1) + 6 + c.text_w(val, 1) + 14
+                                    for lab, val, _ in cells) > room + 14:
+            cells.pop()
+            dropped += 1
+        if dropped:
+            c.info.append('RECENT drops %d of 6 columns at this font size' % dropped)
+        cell_row(c, ix, iy + i * pitch, rw - 16, cells, scale=1, row_h=pitch, max_rows=1)
+
+
 def draw(c, m, args, idx):
     # pages composite onto the previous page: the canvas has to start empty,
     # otherwise dense text from the last page (CPU's system list) stays visible
@@ -1589,6 +2235,8 @@ def draw(c, m, args, idx):
         body_gpu(c, m, args, y0, h, only=gpu_only)
     elif page == 'PROC':
         body_proc(c, m, args, y0, h)
+    elif page == 'AI':
+        body_ai(c, m, args, y0, h)
 
 
 # ── font sheet / debug ─────────────────────────────────────────────────
@@ -1638,6 +2286,22 @@ def print_sensors(m):
               % (th.why, th.fail, th.period,
                  ', poller stopped' if th.disabled else ''))
     print('interfaces    : %s' % (', '.join(sorted(m.net) or ['NONE'])))
+    ep = (m.strata_thread.endpoints if m.strata_thread is not None else [])
+    print('strata server : %s' % (', '.join('%s (%s)' % (u, n) for u, k, n in ep[:3])
+                                  or 'NONE -- no launch config, no STRATA_URL'))
+    th = m.strata_thread
+    if th is not None and th.metrics is not None:
+        v = strata_view(th.metrics) or {}
+        print('strata metrics: model %s  state %s  speed %s tok/s  %d gpu(s)  %d recent'
+              % (v.get('model') or '?', v.get('state') or '?',
+                 sfmt((v.get('speed') or (None,))[0], 1), v.get('gpus') or 0,
+                 len(v.get('recent') or [])))
+    if th is not None and th.metrics is None:
+        print('strata poll   : %s  (%d failures, next in %.0fs%s)'
+              % (th.why, th.fail, th.period, ', nothing to poll' if not th.endpoints else ''))
+    if th is not None and th.pinned is not None:
+        print('strata source : %s  (from %s, polled every %.0fs)' % (th.server, th.source,
+                                                                      th.period))
     print('freqs         : %s' % ('%d' % len(m.freqs)))
     print('disks         : %s' % (', '.join('%s %.0f%%' % (d[0], d[1] * 100)
                                             for d in m.disks) or 'NONE'))
@@ -1844,6 +2508,18 @@ def main():
                     'erases the ghost of the previous page using this page\'s own colours (no black flash).  '
                     'fade: 50/50 blend frame.  black: flush a black frame.  none: just switch.')
     ap.add_argument('--no-gpu', action='store_true')
+    ap.add_argument('--no-strata', dest='strata', action='store_false',
+                    help='skip the strata server: the AI page says the page is disabled')
+    ap.add_argument('--strata-url', help='strata server root (default: found from the '
+                    'launch configs strata writes, then STRATA_URL)')
+    ap.add_argument('--strata-key', help='API key for /metrics (default: the key in the '
+                    'launch config that owns that port, then STRATA_API_KEY)')
+    ap.add_argument('--strata-state', metavar='DIR',
+                    help='where to look for the state a strata install writes (its launch '
+                    'configs and ready files); default $STRATA_STATE, then '
+                    '$XDG_STATE_HOME/strata.  The dashboard service runs as a dedicated '
+                    'user with no access to your home, so on a service box this is the '
+                    'path to your login\'s ~/.local/state/strata')
     ap.add_argument('--sensors', action='store_true', help='print what was found and exit')
     ap.add_argument('--font-sample', action='store_true')
     args = ap.parse_args()
@@ -1894,13 +2570,17 @@ def main():
         print('font sheet -> %s' % args.out)
         return 0
 
-    m = Metrics(gpu=not args.no_gpu, history=args.history, interval=args.interval)
+    m = Metrics(gpu=not args.no_gpu, history=args.history, interval=args.interval,
+                strata=args.strata, strata_url=args.strata_url,
+                strata_key=args.strata_key, strata_state=args.strata_state)
     # an empty title is the hostname: the systemd unit ships TITLE unset, so a
     # box identifies itself on the panel without a hard-coded name in the repo
     if not args.title.strip():
         args.title = m.host
     if m.gpu_thread is not None:
         m.gpu_thread.start()
+    if m.strata_thread is not None:
+        m.strata_thread.start()
     for _ in range(2):
         m.sample()
         time.sleep(0.25)
@@ -1913,8 +2593,13 @@ def main():
             if m.gpu_thread is None or m.gpu_thread.gpus:
                 break
             time.sleep(0.25)
+        for _ in range(20):
+            if m.strata_thread is None or m.strata_thread.metrics:
+                break
+            time.sleep(0.25)
         m.sample()
         m.gpu = m.gpu_thread.gpus if m.gpu_thread else None
+        m.strata = m.strata_thread.metrics if m.strata_thread else None
         print_sensors(m)
         m.shutdown()
         return 0

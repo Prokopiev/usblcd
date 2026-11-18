@@ -11,13 +11,23 @@
 # of the keys below (all optional), then `systemctl restart usblcd-dashboard`.
 #
 #   TITLE=myhost           header title (empty = the machine hostname)
-#   PAGES=CPU,GPU,PROC     pages to rotate; a single page pins the panel
+#   PAGES=CPU,GPU,PROC,AI  pages to rotate; a single page pins the panel
 #   PAGE_SECONDS=12        seconds per page (0 = never rotate)
 #   INTERVAL=1             seconds between frames
 #   WEIGHT=500             Inter variable weight
 #   CPUS=16-23             pin to specific CPUs, e.g. the efficient cores of a
 #                          hybrid CPU (see the note under CPUAffinity below)
 #   NICE=10                scheduling priority
+#   STRATA_URL=…           the inference server the AI page reads (GET /metrics)
+#   STRATA_API_KEY=…       its API key: that file then holds a secret, chmod 600
+#                          (`sudo sh -c 'umask 077; python3 tools/strata_conf.py >>
+#                           /etc/usblcd/dashboard.conf'` writes both from the
+#                           state this box already has)
+#   STRATA_STATE=/path     where to look for a strata install's state instead of
+#                          $XDG_STATE_HOME/strata — only useful when this unit's
+#                          user can read those files (they are written 0600 by
+#                          the login that runs the model, so for a service box
+#                          the two keys above are the ones that work)
 #
 # dash.py draws a frame per interval and pipes raw RGBA into `usblcd feed`.
 # The panel reverts to its boot logo the moment the service stops, which is the
@@ -31,6 +41,8 @@ After=local-fs.target network-online.target
 # boot, nvidia-smi answers a few seconds after this unit does, and dash.py
 # keeps polling, so the GPU page fills itself in (see the GPU page note in the
 # README).  A `Wants=` on the driver would only move the race, not fix it.
+# same for the inference server behind the AI page: it comes up minutes after
+# this unit, its own poller waits, and no dependency would make it arrive sooner
 # a crashing loop should not stay recoverable forever, but a panel unplugged
 # for an hour must not put the unit in a failed state either
 StartLimitIntervalSec=0
@@ -39,7 +51,7 @@ StartLimitIntervalSec=0
 Type=simple
 WorkingDirectory=/opt/usblcd
 Environment=TITLE=
-Environment=PAGES=CPU,GPU,PROC
+Environment=PAGES=CPU,GPU,PROC,AI
 Environment=PAGE_SECONDS=12
 Environment=INTERVAL=1
 Environment=WEIGHT=500

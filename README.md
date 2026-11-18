@@ -237,7 +237,8 @@ exactly which panel a piece of text belongs to and where its edges are.
 
 Metrics: CPU package/core temps, per-core utilisation bars, load, frequency,
 CPU temp + utilisation history; GPU util/VRAM/temp/fan/power via `nvidia-smi`
-(`--no-gpu` to skip); RAM/swap; per-mount disk fill; net rx/tx per interface +
+(`--no-gpu` to skip); the local inference server's own `/metrics` (the AI page,
+`--no-strata` to skip); RAM/swap; per-mount disk fill; net rx/tx per interface +
 rolling history; NVMe/chassis temps; fan RPM; top processes by CPU and by RSS.
 Every section is guarded on its own — a missing sensor drops its panel, it
 never stops the frame.
@@ -255,9 +256,24 @@ reason, the attempt count, and how long ago the last good reply was). Numbers
 kept on screen from an older reply are marked `STALE Ns` — an unlabelled stale
 number on a dashboard is worse than no number.
 
+The AI page is the strata monitor's Overview (its first view, `strata monitor`
+view 1) drawn on the panel: it GETs the same `/metrics` the monitor reads, in a
+background thread, with the poll rules the GPU page learned (a server that boots
+after this service, a model load that takes minutes and a restart all heal, so
+the poll backs off — 3, 6, 12, 24, 30 s, then 2 min — and the first good reply
+lights the page back up by itself).  Nothing is installed, started or written:
+the poller reads the launch configs a strata install already wrote (its port and
+the API key `/metrics` answers 401 without), pairs them with the ready file of
+the server that is actually running, and issues one GET per poll.  Point it
+elsewhere with `--strata-url` / `--strata-key` / `--strata-state`, or with
+`STRATA_URL` / `STRATA_API_KEY` / `STRATA_STATE` in the environment.  The
+sparklines use the histories the server itself ships (a minute per series), so
+the curve on the panel is the curve the monitor draws.  A number the server did
+not report is drawn `--`, never as an invented zero.
+
 Layout (960×540 default; `--width/--height` for other panels). The header
 (host, title, kernel, uptime, clock) stays on **every** page, with tabs showing
-which page is up and a countdown to the next; the body rotates through three
+which page is up and a countdown to the next; the body rotates through four
 pages, 12 s each by default:
 
 | page | contents |
@@ -265,6 +281,7 @@ pages, 12 s each by default:
 `CPU` | big package temp + utilisation, load, clocks, 16 core bars with per-core temps, utilisation and temp histories with peaks, core maxes, NVMe temps · RAM/swap bars, per-mount disk fill, boot time · network rx/tx + history + peak + NIC temp
 `GPU` | one panel per GPU (util, temp, VRAM bar, memory-bus %, fan, watts, util and temp histories) · fleet strip: mean util, total VRAM, total watts, board-chip temps, NIC temp, thermal zones, fans
 `PROC` | top-14 processes by CPU with bars, smoothed with an EWMA so the list does not reshuffle every frame · top-10 by RSS with bars · system panel (load, threads, procs, ctxt/s, intr/s, RAM, swap, CPU temp, uptime)
+`AI` | model strip (state, phase, prompt/decode progress, context fill, LIVE/STALE age, which server answered) · the Overview's eight tiles with sparklines: tok/s (live rate while generating, the run's average while idle), GPU load, VRAM, GPU temp, power, PCIe rx, host CPU, disk read · bars for context fill, experts in VRAM and system RAM · the last requests with hit rate, tokens, tok/s, duration and how each ended
 
 Panel titles get a measured band: `TITLE_TOP` above the caption, the caption
 itself (`text_h(scale 2)`), and `TITLE_PAD` below it, so the first row of every
@@ -274,11 +291,13 @@ hardcoded 28 px title band.
 
 ```sh
 python3 dash/dash.py --page CPU                    # pin one page
+python3 dash/dash.py --page AI                     # the inference-server page
 python3 dash/dash.py --pages CPU,PROC --page-seconds 20
 python3 dash/dash.py --page-seconds 0              # rotation off
 python3 dash/dash.py --ring 20                     # bigger countdown dial
 python3 dash/dash.py --ring 0                      # no countdown dial
 python3 dash/dash.py --sensors                     # what was discovered on this box
+python3 dash/dash.py --strata-url http://127.0.0.1:8095 --strata-key …
 python3 tools/preview.py /tmp/usblcd-dashboard.ppm # ASCII view of a rendered frame
 ```
 
@@ -292,14 +311,18 @@ one the default route uses, picked with a connected UDP socket so it works with
 no internet — and the clock sits between it and the dial.
 
 Thresholds colour temp green/amber/red at 70/85 °C, disk/RAM at 80 %.
-Cost per frame at 960×540, measured: 7 ms metrics, 7 ms draw, 0.4 ms hand-off
-to `usblcd` — 15 ms total, **2.6 % of one core at 1 fps**. The canvas is
-RGBA8888 in native order, so a frame is one buffer write; the RGBA→RGB PPM for
-preview drops alpha with a single regex pass. `--sensors` is the debugging entry point: it
+Cost per frame at 960×540, measured: 7 ms metrics, 7 ms draw (11 ms on the AI
+page, which draws eleven panels and eight sparklines), 0.4 ms hand-off to
+`usblcd` — 15 ms total, **2.6 % of one core at 1 fps**.  The `nvidia-smi` and
+`/metrics` queries run in their own threads, so a slow query is never part of a
+frame.  The canvas is RGBA8888 in native order, so a frame is one buffer write;
+the RGBA→RGB PPM for preview drops alpha with a single regex pass.
+`--sensors` is the debugging entry point: it
 prints the CPU package/core/thermal-zone/NVMe/NIC/board temps, fans, GPUs
-(`nvidia-smi`), interfaces and mounts it found — every panel is built from
-exactly that list, so a panel showing `NONE` means the sensor is not exposed
-by the kernel, not that the renderer failed.
+(`nvidia-smi`), the strata endpoints it found (the URL, which launch config the
+key came from, the model, the poll state) and mounts it found — every panel is
+built from exactly that list, so a panel showing `NONE` means the sensor is not
+exposed by the kernel (or no server is configured), not that the renderer failed.
 
 `tools/ppm2png.c` converts the rendered PPM to PNG so you can inspect a frame
 from your laptop; `usblcd` reads the PPM directly, so nothing on the panel path
@@ -323,7 +346,10 @@ helper), `fonts/` and the README to `/opt/usblcd`, and installs
 It does not enable anything itself — run the `systemctl` lines above.
 
 Tune it without editing the unit: `/etc/usblcd/dashboard.conf` overrides
-`TITLE`, `PAGES`, `PAGE_SECONDS`, `INTERVAL`, `WEIGHT`, `CPUS` and `NICE`.
+`TITLE`, `PAGES` (`CPU,GPU,PROC,AI`), `PAGE_SECONDS`, `INTERVAL`, `WEIGHT`,
+`CPUS`, `NICE` and, for the AI page, `STRATA_URL` / `STRATA_API_KEY` /
+`STRATA_STATE` (see the AI page note above — on a service box the first two are
+the ones that work, and the file then holds a secret).
 
 The unit starts at boot (`WantedBy=multi-user.target`), restarts on any exit
 (`Restart=always`, `RestartSec=5`, no start limit, so an hour-long unplug
@@ -346,7 +372,48 @@ bitmap font.
 
 The unit deliberately depends on nothing NVIDIA: it starts seconds before the
 driver answers `nvidia-smi`, and the dashboard's GPU poller retries, so the GPU
-page fills in by itself a few seconds after boot.
+page fills in by itself a few seconds after boot.  It depends on nothing strata
+either, for the same reason — the inference server comes up minutes after the
+unit does, and the AI page's poller waits for it.
+
+The AI page is the one panel source the service user cannot see by itself: the
+strata state (`launch` configs, `runtime` ready files, and the API key
+`/metrics` demands) is written 0600 by the login that runs the model, and the
+unit runs as `usblcd` with `ProtectHome=read-only` — read-only is not readable
+by another user.  So on a service box the AI page starts empty (`NO STRATA
+SERVER`, with the paths it looked in) until you tell it where to go, in
+`/etc/usblcd/dashboard.conf`:
+
+```conf
+PAGES=CPU,GPU,PROC,AI
+STRATA_URL=http://127.0.0.1:47832
+STRATA_API_KEY=…                # the key in ~/.local/state/strata/launch/<profile>.json
+```
+
+`chmod 600 /etc/usblcd/dashboard.conf` (it then holds a secret).  The two keys
+take precedence over anything found on disk, so the page does not depend on the
+service being able to read your home.
+
+`STRATA_STATE=<dir>` (or `--strata-state`) is the third key: it points the
+discovery at a strata state tree, for a dashboard that runs as the login that
+runs the model — your own `python3 dash/dash.py`, a user unit, or a state
+directory that is group-readable.  A dashboard running as that login needs
+nothing at all: it finds `~/.local/state/strata` by itself, and under `sudo` it
+searches the login that typed `sudo` too (root can read its 0600 configs).
+
+`tools/strata_conf.py` writes those keys for you, from the same discovery the
+AI page uses, so there is nothing to copy by hand:
+
+```sh
+python3 tools/strata_conf.py --check                       # what it would write, and proof it answers
+sudo sh -c 'umask 077; python3 tools/strata_conf.py >> /etc/usblcd/dashboard.conf'
+sudo systemctl restart usblcd-dashboard
+```
+
+It prints `STRATA_URL=` / `STRATA_API_KEY=` lines only (never a half-config: it
+exits 1 and writes nothing when it finds no server), `--url`/`--key` override the
+discovery, and `--state` reads another login's state tree.  `make install-service`
+copies `dash/`, not `tools/`, so run it from the project directory.
 
 ## Capture pipelines (`feed`)
 

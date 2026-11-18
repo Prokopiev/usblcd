@@ -31,7 +31,7 @@ echo "== encoders (RGB565, JPEG 4:4:4, rotation, fit, brightness)"
 
 echo
 echo "== dashboard renderer (stdlib python + 5x7 font)"
-for pg in CPU GPU PROC; do
+for pg in CPU GPU PROC AI; do
 	python3 dash/dash.py --once --page $pg --title TEST --out build/tests/dash_$pg.ppm >/dev/null
 	test -s build/tests/dash_$pg.ppm && echo "dash.py page $pg OK ($(stat -c%s build/tests/dash_$pg.ppm) bytes)"
 	# header (15) + 960*540 RGB: catches a stride/format regression
@@ -42,8 +42,10 @@ for pg in CPU GPU PROC; do
 done
 ./build/ppm2png build/tests/dash.ppm build/tests/dash.png >/dev/null && echo "ppm2png OK"
 python3 dash/dash.py --font-sample --out build/tests/font.ppm >/dev/null && echo "font sheet OK"
+python3 dash/dash.py --once --page AI --no-strata --title TEST --out build/tests/dash_AI_off.ppm >/dev/null && echo "AI page with --no-strata OK"
 python3 tests/test_font.py
 python3 tests/test_gpu.py
+python3 tests/test_strata.py
 
 echo
 echo "== calibration store (measured-on-glass offsets)"
